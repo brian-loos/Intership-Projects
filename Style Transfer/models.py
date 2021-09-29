@@ -104,20 +104,20 @@ def save_model(model,home_dir, model_path, model_fname):
 def init_weights_xavier(m):
   if isinstance(m,nn.Conv2d):
     torch.nn.init.xavier_normal_(m.weight)
-    if m.bias.data is not None: 
+    if m.bias is not None: 
       m.bias.data.fill_(0.)
   elif isinstance(m,nn.ConvTranspose2d): 
     torch.nn.init.xavier_normal_(m.weight)
-    if m.bias.data is not None: 
+    if m.bias is not None: 
       m.bias.data.fill_(0.)
 def init_weights_kaiming(m):
   if isinstance(m,nn.Conv2d):
     torch.nn.init.kaiming_normal_(m.weight)
-    if m.bias.data is not None: 
+    if m.bias is not None: 
       m.bias.data.fill_(0.)
   elif isinstance(m,nn.ConvTranspose2d): 
     torch.nn.init.kaiming_normal_(m.weight)
-    if m.bias.data is not None: 
+    if m.bias is not None: 
       m.bias.data.fill_(0.)
 
 
@@ -125,32 +125,37 @@ def init_weights_kaiming(m):
 
 #dataset specifically for AdaIN 
 class adainDataset(Dataset.Dataset):
-    def __init__(self, annotations_file, img_dir, transform=None,index = 2):
+    def __init__(self, target_path, source_path, target_anno_path, source_anno_path, transform=None):
         '''
             we just want an unlabelled image dataset
         '''
-        file = open(annotations_file, 'rb')
-        self.img_labels = pickle.load(file)
-        self.style_cols = self.img_labels.columns[1:]
-        self.img_dir = img_dir
+        self.target_labels = pd.read_csv(target_anno_path)
+        self.style_labels = pd.read_csv(source_anno_path) 
+        self.target_dir = target_path
+        self.source_path = source_path
         self.transform = transform
-        self.ind =index
+        self.num_styles = len(self.style_labels)
+        
         
     def __len__(self):
-        return (len(self.img_labels))
+        return (len(self.target_labels))
 
     def __getitem__(self, idx):
-        img_path = os.path.join(self.img_dir, self.img_labels.iloc[idx, self.ind])
+        r = np.random.randint(0,self.num_styles)
+        img_path = os.path.join(self.target_dir, self.target_labels.iloc[idx, 1])
+        style_path = os.path.join(self.source_path, self.style_labels.iloc[r,1])
         image = read_image(img_path)/255
+        style_image= read_image(style_path)/255
         if self.transform:
             image = self.transform(image)
-        target_styles = [self.img_labels[col][idx] for col in self.style_cols]
-        return image, target_styles
+            style_image = self.transform(style_image)
+        return image, style_image
+        
 #initializes the dataset above into a dataloader
-def adain_dataloader(data_path = None,label_path = None,data_transform = None,index = 2,batch_size = 8):
-    dataset = adainDataset(label_path, data_path, transform=data_transform,index = index)
+def adain_dataloader(target_path = None,source_path = None, target_anno_path = None,source_anno_path = None, data_transform = None, batch_size = 8):
+    dataset = adainDataset(target_path, source_path,target_anno_path, source_anno_path, transform=data_transform)
     loader = torch.utils.data.DataLoader(
-         dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+         dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     return loader,dataset
 
 ##_____________________________________________________________________________________________________
@@ -169,17 +174,19 @@ class StyleLoss(nn.Module):
   def forward(self,input, means, stds): 
     loss = 0
     for s, mean, std in zip(input, means,stds): 
-      loss += torch.linalg.norm(self.compute_mean(s)-mean, 2, 1) + torch.linalg.norm(self.compute_var(s,self.compute_mean(s))-std, 2, 1)
-    return loss.mean()
+      m = self.compute_mean(s) 
+      var = self.compute_var(s, m)
+      loss += F.mse_loss(m,mean) + F.mse_loss(var, std)
+    return loss
 
   def compute_mean(self, style):
     n,c,h,w = style.shape 
-    mu = style.sum(dim = (2,3)) 
+    mu = style.sum(dim = (2,3), keepdims = True) 
     return mu.div(h*w) #---> normalize mean 
   
   def compute_var(self, style, mean, eps = 1e-8): 
     n,c,h,w = style.shape 
-    sigma = style.sum(dim =(2,3)).div(h*w) + eps
+    sigma = (style-mean).pow(2).sum(dim =(2,3),keepdims = True).div(h*w) + eps
     return sigma.sqrt() 
 
 
@@ -194,7 +201,7 @@ def normMSELoss(input,target):
 def contentLoss(contents, target_content): 
   content_loss = 0 
   for content,target in zip(contents, target_content): 
-    content_loss+= normMSELoss(content,target) 
+    content_loss+= F.mse_loss(content,target)#normMSELoss(content,target) 
   return content_loss
 ###PIXELWISELOSS normalized loss
 def pixelLoss(gen_image, target_image): 
@@ -308,10 +315,9 @@ class LITAdaINDataModule(pl.LightningDataModule):
                         train_im_size = 256, 
                         val_im_size = 512, 
                         data_zip : [str] = [],  ####<-------- format these as [traindir, labeldir]
-                        data_path :  [str] = [], #### <------------------------| if data_zip is empty, assume these are absolute paths
-                        train_anno_path : str = 'data/train.pkl',
-                        test_anno_path : str = 'data/test.pkl',
-                        val_anno_path : str = 'data/val.pkl',
+                        data_path :  [str] = [], #### <------------------------| if data_zip is empty, assume these are absolute paths to different data sets
+                        train_anno_path : str = 'target.csv',
+                        source_anno_path : str = 'source.csv'
                         ): 
         super().__init__() 
         self.batch_size = train_batch_size
@@ -319,11 +325,10 @@ class LITAdaINDataModule(pl.LightningDataModule):
         self.im_size = train_im_size
         self.val_im_size = val_im_size
         self.data_dirs = data_path
-        self.train_dir = data_path[0]
-        self.test_dir = data_path[1]
-        self.train_file = train_anno_path
-        self.test_file = test_anno_path
-        self.val_file = val_anno_path
+        self.target_dir = data_path[0]
+        self.style_dir = data_path[1]
+        self.target_file = train_anno_path
+        self.style_file = source_anno_path
         self.data_zip = data_zip
     
     def prepare_data(self): 
@@ -337,9 +342,9 @@ class LITAdaINDataModule(pl.LightningDataModule):
         
         
     def train_dataloader(self): 
-        transform  = t.Compose([ t.Resize(self.im_size), t.CenterCrop((self.im_size,self.im_size))]) 
-        loader,dataset = adain_dataloader(data_path = self.train_dir, label_path = self.train_file,\
-                                data_transform = transform, batch_size = self.batch_size, index =0)
+        transform  = t.Compose([ t.Resize(self.im_size*2), t.RandomCrop((self.im_size,self.im_size))]) 
+        loader,dataset = adain_dataloader(target_path = self.target_dir, source_path = self.style_dir, target_anno_path = self.target_file,\
+                                source_anno_path = self.style_file, data_transform = transform, batch_size = self.batch_size)
         return loader
         
     # def val_dataloader(self): 
@@ -367,20 +372,20 @@ class ConvLayer(nn.Module):
     super().__init__() 
     self.main = nn.Sequential(
                               nn.Conv2d(in_channels, out_channels, kernel_size = 3, 
-                                        stride = 1,padding =1, padding_mode = 'reflect', bias = True), 
+                                        stride = 1,padding =1, padding_mode = 'reflect'), 
                               getattr(nn,normalization_method)(out_channels, affine = True), 
                               nn.LeakyReLU(.2,inplace= True), 
                               nn.Conv2d(out_channels, out_channels, kernel_size = 3, 
-                                        stride = 1,padding =1, padding_mode = 'reflect', bias = True), 
+                                        stride = 1,padding =1, padding_mode = 'reflect'), 
                               getattr(nn,normalization_method)(out_channels, affine = True), 
                               nn.LeakyReLU(.2,inplace= True), 
                               nn.Conv2d(out_channels, out_channels, kernel_size = 1, 
-                                        stride = 1, bias = True), 
+                                        stride = 1), 
                               getattr(nn,normalization_method)(out_channels, affine = True), 
                               nn.LeakyReLU(.2,inplace= True)     
                               )
   def forward(self,input): 
-    return self.main(input) 
+    return self.main(input)
 
 '''
     Multiscale Join
@@ -434,8 +439,7 @@ class StyleTransferGenerator(nn.Module):
       
     self.final_block = nn.Sequential(
                                     ConvLayer(branch_feat_maps , branch_feat_maps,normalization_method), 
-                                    nn.Conv2d(branch_feat_maps, im_channels,kernel_size = 1, bias = True), 
-                                    getattr(nn, normalization_method)(im_channels, affine = True), 
+                                    nn.Conv2d(branch_feat_maps, im_channels,kernel_size = 1),
                                     nn.LeakyReLU(.2,inplace = False)
                                     )
   
@@ -472,7 +476,7 @@ class TextureNet(nn.Module):
         assert vgg_net in ['vgg19', 'vgg16', 'vgg19_bn'] 
         if vgg_net == 'vgg19': 
             content_layers = [22]
-            style_layers = [3,8,15,18,24]
+            style_layers = [3,8,15,20,29]
             vgg_model = m.vgg19(pretrained = True)
         elif vgg_net == 'vgg19_bn': 
             content_layers = [32]
@@ -528,6 +532,7 @@ class LITTextureNet(pl.LightningModule):
         '''
             get target styles
         '''
+        self.style_image = style_image
         style_input = Variable(style_image,requires_grad = False)
         _,styles = self.texture_net.feature_net(style_input)
         self.target_styles = nn.ParameterList()
@@ -558,7 +563,7 @@ class LITTextureNet(pl.LightningModule):
         input += Variable(torch.rand(input.shape, device = input.device),requires_grad = False)*self.noise_scale_factor
         input.clip_(0,1)
         contents, styles, target_contents = self(input) 
-        style_loss = styleLoss(styles, self.target_styles, mode = 'fro')*self.style_weight
+        style_loss = styleLoss(styles, self.target_styles, mode = 'mse')*self.style_weight
         content_loss = contentLoss(contents, target_contents)*self.content_weight
         loss = style_loss + content_loss
         self.log('content_loss', content_loss.detach(), on_step = True, on_epoch = True)
@@ -574,7 +579,10 @@ class LITTextureNet(pl.LightningModule):
         
         with torch.no_grad(): 
             sample_imgs = self.texture_net.Transfer_network(self.val_image)
+            sample_imgs.clip_(1e-8, 1-1e-8) 
+            sample_imgs = torch.cat((sample_imgs.to(sample_imgs.device), self.val_image.to(sample_imgs.device), self.style_image.to(sample_imgs.device)),dim = 0)
             grid = torchvision.utils.make_grid(sample_imgs).unsqueeze(0)
+            
             self.logger.experiment.add_images('generated_images', grid, epoch)
         
     # def validation_step(self, batch,batch_idx): 
@@ -677,7 +685,7 @@ class FastNeuralTransfer(nn.Module):
         assert vgg_net in ['vgg19', 'vgg16', 'vgg19_bn'] 
         if vgg_net == 'vgg19': 
             content_layers = [22]
-            style_layers = [3,8,15,18,24]
+            style_layers = [3,8,15,20,29]
             vgg_model = m.vgg19(pretrained = True)
         elif vgg_net == 'vgg19_bn': 
             content_layers = [32]
@@ -767,13 +775,14 @@ class LITFastNST(pl.LightningModule):
         contents, styles, target_contents,gen_output = self(input) 
         style_loss = styleLoss(styles, self.target_styles, mode = 'fro')*self.style_weight
         content_loss = contentLoss(contents, target_contents)*self.content_weight
-        pixel_loss = pixelLoss(gen_output, input) *self.pixel_weight
-        tv_loss =  totalVariationLoss(gen_output) *self.tv_weight
-        loss = style_loss + content_loss + pixel_loss + tv_loss
+        #pixel_loss = pixelLoss(gen_output, input) *self.pixel_weight
+        #tv_loss =  totalVariationLoss(gen_output) *self.tv_weight
+        loss = style_loss + content_loss# + pixel_loss + tv_loss
         self.log('content loss', content_loss.detach())
         self.log('style loss', style_loss.detach()) 
-        self.log('pixel loss', pixel_loss.detach())
-        self.log('tv loss', tv_loss.detach())
+        #self.log('pixel loss', pixel_loss.detach())
+        #self.log('tv loss', tv_loss.detach())
+        self.log('total loss', loss.detach())
         return loss
     
     def training_epoch_end(self, training_step_outputs):
@@ -785,6 +794,7 @@ class LITFastNST(pl.LightningModule):
         
         with torch.no_grad(): 
             sample_imgs = self.texture_net.Transfer_network(self.val_image)
+            sample_imgs.clip_(1e-8, 1-1e-8) 
             grid = torchvision.utils.make_grid(sample_imgs).unsqueeze(0)
             self.logger.experiment.add_images('generated_images', grid, epoch )    
     # def validation_step(self, batch,batch_idx): 
@@ -817,14 +827,14 @@ class AdaIN(nn.Module):
   #returns an N x C x 1 x 1 tensor
   def compute_mean(self, style):
     n,c,h,w = style.shape 
-    mu = style.sum(dim = (2,3)) 
-    return mu.div(h*w).view(n,c,1,1) #---> normalize mean 
+    mu = style.sum(dim = (2,3),keepdims = True) 
+    return mu.div(h*w) #---> normalize mean 
   
   #returns an N x C x 1 x 1 tensor
   def compute_var(self, style, mean, eps = 1e-8): 
     n,c,h,w = style.shape 
-    sigma = style.sum(dim = (2,3)).div(h*w) + eps
-    return sigma.sqrt().view(n,c,1,1)
+    sigma = (style-mean).pow(2).sum(dim = (2,3),keepdims = True).div(h*w) + eps
+    return sigma.sqrt()
 
 '''
   applies adain to each layer to normalize
@@ -834,17 +844,18 @@ class AdaModule(nn.Module):
   def __init__(self): 
     super().__init__() 
     self.adain = AdaIN()
-  def forward(self, styles, target_means, target_devs): 
-    out = [] 
-    for style, target_mean, target_dev in zip(styles, target_means, target_devs): 
-      moduled_styles =self.adain(style,target_mean, target_dev)
-      out += [moduled_styles]
+  def forward(self, style, target_mean, target_dev): 
+    out = []
+    for s, m, d in zip(style, target_mean, target_dev): 
+        moduled_styles =self.adain(s,m, d)
+        out += [moduled_styles]
+    #out = self.adain(style,target_mean,target_dev)
     return out
 '''
   decoder, mimics vgg network layout, inverted, with no normalization
 '''
 class VggConvBlock(nn.Module): 
-  def __init__(self, in_channels, out_channels,num_layers = 4, kernel = 3, stride =1 , padding = 1, padding_mode = 'reflect', bias = True): 
+  def __init__(self, in_channels, out_channels,num_layers = 4, kernel = 3, stride =1 , padding = 1, padding_mode = 'reflect', bias = False): 
     super().__init__() 
     self.conv_layer = nn.Sequential(
         nn.Conv2d(in_channels, in_channels, kernel_size= kernel, stride = stride, padding = padding, padding_mode = padding_mode, bias = bias), 
@@ -868,7 +879,7 @@ class RealTimeDecoder(nn.Module):
   def __init__(self): 
     super().__init__() 
     self.module = nn.ModuleDict()
-    upsample = nn.Upsample(scale_factor=2, mode = 'nearest')
+    upsample = nn.Upsample(scale_factor=2, mode = 'bilinear')
     self.module['convblock1'] = VggConvBlock(512,256, num_layers = 4)
     self.module['convblock2'] = VggConvBlock(256*2,128, num_layers = 4)
     self.module['convblock3'] = VggConvBlock(128*2,64, num_layers = 2)
@@ -886,7 +897,8 @@ class RealTimeDecoder(nn.Module):
     out = self.module['convblock3'](out,input[2])
     out = self.module['upsample'](out)
     out = self.module['convblock4'](out,input[3])
-    return out 
+    return torch.tanh(out)
+    
 class AdaINTransfer(nn.Module): 
     def __init__(self,vgg_net : str = 'vgg16' 
                       ): 
@@ -895,6 +907,9 @@ class AdaINTransfer(nn.Module):
         self.Decoder = RealTimeDecoder()
         #create AdaModule
         self.ada_module = AdaModule() 
+        #define style loss class 
+        self.style_loss = StyleLoss() 
+        
         #create feature extraction network
         assert vgg_net in ['vgg19', 'vgg16', 'vgg19_bn'] 
         if vgg_net == 'vgg19': 
@@ -914,12 +929,20 @@ class AdaINTransfer(nn.Module):
         #initialization weights
         self.Decoder.apply(init_weights_xavier)
     
-    def forward(self,input, target_means, target_devs): 
+    def forward(self,input, style_target): 
         _,input_styles = self.Encoder(input)
-        modulated_styles = self.ada_module(input_styles, target_means, target_devs)[::-1]
-        generated_output = self.Decoder(modulated_styles)
+        _, target_styles = self.Encoder(style_target)
+        target_means = [] 
+        target_devs = []
+        for style in target_styles: 
+            target_means.append(self.style_loss.compute_mean(style).to(input.device))
+            target_devs.append(self.style_loss.compute_var(style, target_means[-1]).to(input.device))
+        #target_mean = self.style_loss.compute_mean(target_styles[-1].to(input.device)) 
+        #target_dev = self.style_loss.compute_var(target_styles[-1], target_mean).to(input.device) 
+        modulated_style = self.ada_module(input_styles, target_means, target_devs)[::-1]
+        generated_output = self.Decoder(modulated_style)
         _,styles = self.Encoder(generated_output)
-        return styles, modulated_styles
+        return styles, modulated_style,target_means, target_devs,generated_output
 
 class LITAdaIN(pl.LightningModule): 
     def __init__(self,batch_size : int = 8,
@@ -928,7 +951,9 @@ class LITAdaIN(pl.LightningModule):
                       learning_rate : float = .1, 
                       betas : tuple = (.5,.99),
                       style_weight = 1., 
-                      content_weight = 1. 
+                      content_weight = 1. ,
+                      test_style : torch.Tensor = None, 
+                      test_image : torch.Tensor = None
                       ):  
         super().__init__() 
         #initialize model
@@ -938,26 +963,45 @@ class LITAdaIN(pl.LightningModule):
         self.betas = betas
         self.style_weight = style_weight 
         self.content_weight = content_weight
-        
+        self.test_style = nn.Parameter(test_style, requires_grad = False)
+        self.test_image = nn.Parameter(test_image, requires_grad = False)
         self.loss = StyleLoss() 
         
-    def forward(self,input, means, devs): 
-        styles, mod_styles = self.texture_net(input,means, devs)
-        return styles,mod_styles
+    def forward(self,input,style_target): 
+        styles, mod_styles, means, devs,_ = self.texture_net(input,style_target)
+        return styles,mod_styles, means, devs
     
     def configure_optimizers(self): 
         optimizer = getattr(optim, self.optimizer)(self.texture_net.Decoder.parameters(), lr = self.lr, betas = self.betas) 
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode = 'min', factor = .1, patience = 10, threshold = 1e-2, threshold_mode = 'rel', cooldown = 0, min_lr = 1e-8, eps = 1e-9)
+        return {"optimizer":optimizer, "lr_scheduler":scheduler, "monitor": "total loss"}
     
     def training_step(self, batch, batch_idx): 
-        input, means, devs = batch
-        s , ms = self(input,means,devs) 
-        style_loss = self.Loss(s, means, devs)*self.style_weight
+        input, style_target = batch
+        s , ms,means,devs = self(input,style_target) 
+        style_loss = self.loss(s, means, devs)*self.style_weight
         #loss against the feature maps
+        
         content_loss = contentLoss(s[::-1], ms) *self.content_weight
         self.log('content loss', content_loss.detach())
         self.log('style loss', style_loss.detach()) 
-        return style_loss + content_loss
+        loss = style_loss + content_loss
+        self.log('total loss', loss.detach())
+        return loss
+    
+    def training_epoch_end(self, training_step_outputs):
+        """ Check if we should save a checkpoint after every train epoch """
+        epoch = self.current_epoch
+        # if epoch >= self.start_epoch and (epoch+1 % 100 == 0):
+        #     ckpt_path = f"{self.save_path}_e{epoch}.ckpt"
+        #     trainer.save_checkpoint(ckpt_path)
+        if (self.test_style is not None) and (self.test_image is not None): 
+            with torch.no_grad(): 
+                _, _, _, _, sample_imgs = self.texture_net(self.test_image, self.test_style)#get values
+                sample_imgs.clip_(1e-8, 1-1e-8) 
+                sample_imgs = torch.cat((self.test_image, self.test_style, sample_imgs), dim = 0) 
+                grid = torchvision.utils.make_grid(sample_imgs).unsqueeze(0)
+                self.logger.experiment.add_images('generated_images', grid, epoch )  
         
     # def validation_step(self, batch,batch_idx): 
     #     input,means,devs = batch
